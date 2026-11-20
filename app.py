@@ -267,7 +267,10 @@ if st.sidebar.button("🌐 데이터 가져오기 / 업데이트",type="primary"
     with st.spinner("공식 API에서 데이터를 확인 중입니다..."):
         d,msg=update_history(years,bar)
     st.session_state["history"]=d
-    st.sidebar.success(msg) if "완료" in msg else st.sidebar.warning(msg)
+    if "완료" in msg:
+        st.sidebar.success(msg)
+    else:
+        st.sidebar.warning(msg)
 if st.sidebar.button("📂 저장 데이터 다시 읽기",use_container_width=True):
     st.session_state["history"]=load_data()
 if "history" not in st.session_state: st.session_state["history"]=load_data()
