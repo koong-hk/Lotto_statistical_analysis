@@ -235,7 +235,7 @@ def triples_table(df):
     seen={}
     for _,r in df.iterrows():
         for tri in itertools.combinations(nums(r),3): seen.setdefault(tri,[]).append(int(r["회차"]))
-    rows=[{"번호 조합":", ".join(map(str,k)),"동시 출현 횟수":len(v),"회차 목록":", ".join(map(str,v))} for k,v in seen.items() if len(v)>=3]
+    rows=[{"번호 조합":", ".join(map(str,k)),"동시 출현 횟수":len(v),"회차 목록":", ".join(map(str,v))} for k,v in seen.items() if len(v)>=2]
     return pd.DataFrame(rows).sort_values(["동시 출현 횟수","번호 조합"],ascending=[False,True]) if rows else pd.DataFrame(columns=["번호 조합","동시 출현 횟수","회차 목록"])
 
 def weight_scores(df,window,rstrength,lstrength,gstrength):
@@ -456,34 +456,20 @@ with t3:
     st.write(f"직전 회차와 본번호가 하나 이상 겹치는 비율: **{ar:.2%}**")
     st.dataframe(adj.sort_values("현재 회차",ascending=False),hide_index=True,use_container_width=True)
 with t4:
-    tri=triples_table(df)
-    if tri.empty: st.info("3회 이상 반복된 3개 번호 조합이 없습니다.")
+    tri = triples_table(df)
+    st.caption("선택한 분석 기간에 본번호 3개가 함께 나온 조합과 해당 회차를 표시합니다.")
+    if tri.empty:
+        st.info("2회 이상 반복된 3개 번호 조합이 없습니다.")
     else:
-        # 최소 동시 출현 횟수 슬라이더 오류 방지
-        if tri.empty or "동시 출현 횟수" not in tri.columns:
-            st.info("분석할 3개 번호 조합 데이터가 없습니다.")
-            threshold = 3
-        else:
-            max_count = tri["동시 출현 횟수"].max()
-
-            if tri["동시 출현 횟수"].notna().any():
-                max_count = int(max_count)
-
-                if max_count > 3:
-                    threshold = st.slider(
-                        "최소 동시 출현 횟수",
-                        min_value=3,
-                        max_value=max_count,
-                        value=3
-                    )
-                else:
-                    threshold = 3
-                    st.info("동시 출현 횟수가 3회 이상인 조합만 표시합니다.")
-            else:
-                threshold = 3
-                st.info("동시 출현 횟수 데이터가 없습니다.")
-
-
+        max_count = int(tri["동시 출현 횟수"].max())
+        threshold = 2
+        if max_count > 2:
+            threshold = st.slider("최소 동시 출현 횟수", 2, max_count, 2)
+        st.dataframe(
+            tri.loc[tri["동시 출현 횟수"] >= threshold],
+            hide_index=True,
+            use_container_width=True,
+        )
 
 # Recommendation controls are also reused by backtest.
 with t5:
