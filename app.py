@@ -235,8 +235,16 @@ def triples_table(df):
     seen={}
     for _,r in df.iterrows():
         for tri in itertools.combinations(nums(r),3): seen.setdefault(tri,[]).append(int(r["회차"]))
-    rows=[{"번호 조합":", ".join(map(str,k)),"동시 출현 횟수":len(v),"회차 목록":", ".join(map(str,v))} for k,v in seen.items() if len(v)>=2]
-    return pd.DataFrame(rows).sort_values(["동시 출현 횟수","번호 조합"],ascending=[False,True]) if rows else pd.DataFrame(columns=["번호 조합","동시 출현 횟수","회차 목록"])
+    rows = [
+        {"번호 조합": ", ".join(map(str, numbers)), "동시 출현 횟수": len(rounds),
+         "회차 목록": ", ".join(map(str, sorted(rounds))), "최신 회차": max(rounds)}
+        for numbers, rounds in seen.items() if len(rounds) >= 2
+    ]
+    if not rows:
+        return pd.DataFrame(columns=["번호 조합", "동시 출현 횟수", "회차 목록"])
+    return pd.DataFrame(rows).sort_values(
+        ["최신 회차", "동시 출현 횟수", "번호 조합"], ascending=[False, False, True]
+    ).drop(columns="최신 회차")
 
 def weight_scores(df,window,rstrength,lstrength,gstrength):
     recent=Counter(n for _,r in df.tail(window).iterrows() for n in nums(r))
@@ -456,20 +464,35 @@ with t3:
     st.write(f"직전 회차와 본번호가 하나 이상 겹치는 비율: **{ar:.2%}**")
     st.dataframe(adj.sort_values("현재 회차",ascending=False),hide_index=True,use_container_width=True)
 with t4:
-    tri = triples_table(df)
     st.caption("선택한 분석 기간에 본번호 3개가 함께 나온 조합과 해당 회차를 표시합니다.")
-    if tri.empty:
-        st.info("2회 이상 반복된 3개 번호 조합이 없습니다.")
+    query = st.text_input("회차로 찾기", placeholder="예: 1246, 1250")
+    requested = set(query.replace(",", " ").split())
+    available = set(df["회차"].astype(str))
+    missing = requested - available
+
+    if any(not token.isascii() or not token.isdecimal() for token in requested):
+        st.info("회차 번호는 쉼표나 공백으로 구분해 입력하세요.")
+    elif missing:
+        st.info(f"현재 분석 데이터에 없는 회차: {', '.join(sorted(missing))}")
     else:
-        max_count = int(tri["동시 출현 횟수"].max())
-        threshold = 2
-        if max_count > 2:
-            threshold = st.slider("최소 동시 출현 횟수", 2, max_count, 2)
-        st.dataframe(
-            tri.loc[tri["동시 출현 횟수"] >= threshold],
-            hide_index=True,
-            use_container_width=True,
-        )
+        tri = triples_table(df)
+        if requested:
+            matches = tri["회차 목록"].map(
+                lambda rounds: requested.issubset(rounds.split(", "))
+            ).astype(bool)
+            tri = tri.loc[matches]
+        if tri.empty:
+            st.info("조건에 맞는 반복 3개 조합이 없습니다.")
+        else:
+            max_count = int(tri["동시 출현 횟수"].max())
+            threshold = 2
+            if not requested and max_count > 2:
+                threshold = st.slider("최소 동시 출현 횟수", 2, max_count, 2, key="triple_min_count")
+            st.dataframe(
+                tri.loc[tri["동시 출현 횟수"] >= threshold],
+                hide_index=True,
+                use_container_width=True,
+            )
 
 # Recommendation controls are also reused by backtest.
 with t5:
