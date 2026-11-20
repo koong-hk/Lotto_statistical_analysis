@@ -544,7 +544,7 @@ with t5:
 
 with t6:
     st.subheader("워크포워드 백테스트")
-    st.caption("A·B·C·D 네 가지 가중치 조건을 동일한 검증 회차와 조합 수로 비교합니다. 각 테스트 회차는 해당 회차 이전 데이터만 사용하며, 보너스 번호는 일치 수에 포함하지 않습니다.")
+    st.caption("A·B·C·D·E 다섯 가지 가중치 조건을 동일한 검증 회차와 조합 수로 비교합니다. 각 테스트 회차는 해당 회차 이전 데이터만 사용하며, 보너스 번호는 일치 수에 포함하지 않습니다.")
     max_test_rounds = min(40, len(df) - 8)
     test_n = 2
     if max_test_rounds > 2:
@@ -562,6 +562,7 @@ with t6:
         ("B", "직전 2회 × 2배", 2, 2.0),
         ("C", "직전 4회 × 2배", 4, 2.0),
         ("D", "직전 5회 × 3배", 5, 3.0),
+        ("E", "직전 7회 × 4배", 7, 4.0),
     ]
     st.markdown("#### 비교 조건")
     scenario_table = pd.DataFrame([
@@ -569,11 +570,11 @@ with t6:
         for code, label, n, factor in scenario_defs
     ])
     st.dataframe(scenario_table, hide_index=True, use_container_width=True)
-    st.caption("사용자 지정 번호 가중치는 A·B·C·D 모두에 동일하게 적용됩니다. 직전 회차 가중치와 사용자 지정 번호가 겹치면 배수가 곱해집니다.")
+    st.caption("사용자 지정 번호 가중치는 A·B·C·D·E 모두에 동일하게 적용됩니다. 직전 회차 가중치와 사용자 지정 번호가 겹치면 배수가 곱해집니다.")
 
-    if st.button("🧪 A·B·C·D 비교 백테스트 실행", type="primary", disabled=max_test_rounds < 2):
+    if st.button("🧪 A·B·C·D·E 비교 백테스트 실행", type="primary", disabled=max_test_rounds < 2):
         all_results=[]
-        with st.spinner("A·B·C·D 네 조건을 순차 검증 중입니다..."):
+        with st.spinner("A·B·C·D·E 다섯 조건을 순차 검증 중입니다..."):
             for code, label, recent_n, recent_mult in scenario_defs:
                 params={"weights":{n:bt_factor for n in bt_sel},
                         "recent_rounds":recent_n,"recent_factor":recent_mult,
@@ -585,10 +586,10 @@ with t6:
                     result.insert(0,"조건",code)
                     result.insert(1,"조건 설명",label)
                     all_results.append(result)
-        st.session_state["bt_compare"]=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
-        st.session_state["bt_compare_settings"]={"test_n":test_n,"per":per,"user_numbers":bt_sel,"user_factor":bt_factor}
+        st.session_state["bt_compare_abcde"]=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
+        st.session_state["bt_compare_abcde_settings"]={"test_n":test_n,"per":per,"user_numbers":bt_sel,"user_factor":bt_factor}
 
-    bt=st.session_state.get("bt_compare",pd.DataFrame())
+    bt=st.session_state.get("bt_compare_abcde",pd.DataFrame())
     if not bt.empty:
         # 조건별 비교 지표: 평균 적중 수, 회차별 최고 적중 수 평균, 3개 이상 적중 조합 수
         summary_rows=[]
@@ -602,7 +603,7 @@ with t6:
               .groupby("조건").mean().rename("회차별최고일치 평균").reset_index())
         summary=summary.merge(best,on="조건",how="left")
         summary=summary[["조건","조건 설명","생성조합수","평균일치개수","회차별최고일치 평균","3개이상적중","4개이상적중"]]
-        st.markdown("#### A·B·C·D 성능 비교")
+        st.markdown("#### A·B·C·D·E 성능 비교")
         st.dataframe(summary.round({"평균일치개수":3,"회차별최고일치 평균":3}),hide_index=True,use_container_width=True)
         chart=summary.melt(id_vars=["조건"],value_vars=["평균일치개수","회차별최고일치 평균"],var_name="지표",value_name="평균 적중")
         st.plotly_chart(px.bar(chart,x="조건",y="평균 적중",color="지표",barmode="group",title="조건별 평균 적중 수 비교"),use_container_width=True)
@@ -610,13 +611,13 @@ with t6:
         st.plotly_chart(px.bar(dist,x="일치 개수",y="조합 수",color="조건",barmode="group",title="조건별 일치 개수 분포"),use_container_width=True)
         st.markdown("#### 회차별 최고 적중 수")
         best_each=bt.groupby(["조건","회차"])["일치 개수"].max().reset_index(name="최고 일치")
-        st.plotly_chart(px.line(best_each,x="회차",y="최고 일치",color="조건",markers=True,title="A·B·C·D 회차별 최고 적중 비교"),use_container_width=True)
+        st.plotly_chart(px.line(best_each,x="회차",y="최고 일치",color="조건",markers=True,title="A·B·C·D·E 회차별 최고 적중 비교"),use_container_width=True)
         st.markdown("#### 전체 추천 조합 결과")
         st.dataframe(bt.sort_values(["조건","회차","일치 개수"],ascending=[True,False,False]),hide_index=True,use_container_width=True)
-        st.download_button("A·B·C·D 전체 결과 CSV 다운로드",bt.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCD.csv","text/csv")
-        st.download_button("A·B·C·D 요약 CSV 다운로드",summary.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCD_summary.csv","text/csv")
+        st.download_button("A·B·C·D·E 전체 결과 CSV 다운로드",bt.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCDE.csv","text/csv")
+        st.download_button("A·B·C·D·E 요약 CSV 다운로드",summary.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCDE_summary.csv","text/csv")
     else:
-        st.info("A·B·C·D 비교 백테스트 실행 버튼을 눌러 네 조건을 한 번에 비교하세요.")
+        st.info("A·B·C·D·E 비교 백테스트 실행 버튼을 눌러 다섯 조건을 한 번에 비교하세요.")
 
 with t7:
     st.subheader("API 연결 진단")
