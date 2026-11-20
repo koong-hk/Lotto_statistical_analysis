@@ -328,14 +328,7 @@ elif not reload_saved:
     if refresh_failed:
         st.sidebar.warning("최신 당첨번호를 확인하지 못했습니다.")
 
-df, issues = validate(load_data())
-st.sidebar.subheader("최근 당첨번호 5회차")
-if df.empty:
-    st.sidebar.caption("표시할 당첨번호가 없습니다.")
-    st.info("최신 당첨번호를 가져오지 못했습니다. 왼쪽의 **데이터 가져오기 / 업데이트** 버튼으로 다시 시도하세요.")
-    st.stop()
-
-for _, draw in df.tail(5).iloc[::-1].iterrows():
+def show_sidebar_draw(draw):
     st.sidebar.markdown(f"**{int(draw['회차'])}회** · {draw['추첨일']}")
     balls = "".join(lotto_ball(number) for number in nums(draw))
     if pd.notna(draw["보너스"]):
@@ -344,6 +337,43 @@ for _, draw in df.tail(5).iloc[::-1].iterrows():
         f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px">{balls}</div>',
         unsafe_allow_html=True,
     )
+
+df, issues = validate(load_data())
+st.sidebar.subheader("회차별 당첨번호 검색")
+with st.sidebar.form("sidebar_draw_search"):
+    query = st.text_input("회차 번호", placeholder="예: 1246", max_chars=12)
+    submitted = st.form_submit_button("검색", use_container_width=True)
+
+if submitted:
+    st.session_state.pop("sidebar_draw_result", None)
+    round_text = query.strip().removesuffix("회").strip()
+    if not round_text.isascii() or not round_text.isdecimal() or int(round_text) <= 0:
+        st.sidebar.warning("1 이상의 회차 번호를 입력하세요.")
+    else:
+        draw_number = int(round_text)
+        saved = df.loc[df["회차"] == draw_number]
+        if saved.empty:
+            with st.spinner(f"{draw_number}회 당첨번호 확인 중..."):
+                with history_update_lock():
+                    found = fetch_draw(draw_number)
+        else:
+            found = saved.iloc[0].to_dict()
+        if found is None:
+            st.sidebar.warning(f"{draw_number}회 당첨번호를 조회하지 못했습니다. 회차 번호를 확인하거나 잠시 후 다시 시도하세요.")
+        else:
+            st.session_state["sidebar_draw_result"] = found
+
+if "sidebar_draw_result" in st.session_state:
+    show_sidebar_draw(st.session_state["sidebar_draw_result"])
+
+st.sidebar.subheader("최근 당첨번호 5회차")
+if df.empty:
+    st.sidebar.caption("표시할 당첨번호가 없습니다.")
+    st.info("최신 당첨번호를 가져오지 못했습니다. 왼쪽의 **데이터 가져오기 / 업데이트** 버튼으로 다시 시도하세요.")
+    st.stop()
+
+for _, draw in df.tail(5).iloc[::-1].iterrows():
+    show_sidebar_draw(draw)
 
 dates=pd.to_datetime(df["추첨일"],errors="coerce")
 if dates.notna().any(): df=df[dates>=dates.max()-pd.Timedelta(days=365.25*years)].reset_index(drop=True)
