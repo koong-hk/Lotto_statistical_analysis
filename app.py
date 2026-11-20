@@ -190,6 +190,18 @@ def refresh_latest_history():
     _, message = update_history(only_missing=True)
     return "실패" in message or "가져오지 못했습니다" in message
 
+# 당첨번호 색상은 1~9부터 37~45까지 9개 단위로 구분한다.
+LOTTO_BALL_COLORS = ("#facc15", "#60a5fa", "#f87171", "#cbd5e1", "#4ade80")
+
+def lotto_ball(number, *, bonus=False):
+    color = LOTTO_BALL_COLORS[(number - 1) // 9] if 1 <= number <= 45 else "#cbd5e1"
+    label = f' title="보너스 번호 {number}" aria-label="보너스 번호 {number}"' if bonus else ""
+    return (
+        f'<span{label} style="display:inline-flex;align-items:center;justify-content:center;'
+        f'width:26px;height:26px;border-radius:50%;background-color:{color};'
+        f'color:#111827;font-weight:700;font-size:13px;flex-shrink:0">{number}</span>'
+    )
+
 def nums(row): return sorted(int(row[c]) for c in NC)
 def runs(ns):
     result=[]; cur=[]
@@ -316,12 +328,13 @@ if df.empty:
     st.stop()
 
 for _, draw in df.tail(5).iloc[::-1].iterrows():
-    numbers = " · ".join(str(number) for number in nums(draw))
-    bonus = int(draw["보너스"]) if pd.notna(draw["보너스"]) else "—"
+    st.sidebar.markdown(f"**{int(draw['회차'])}회** · {draw['추첨일']}")
+    balls = "".join(lotto_ball(number) for number in nums(draw))
+    if pd.notna(draw["보너스"]):
+        balls += f'<span aria-hidden="true">+</span>{lotto_ball(int(draw["보너스"]), bonus=True)}'
     st.sidebar.markdown(
-        f"**{int(draw['회차'])}회** · {draw['추첨일']}  \n"
-        f"{numbers}  \n"
-        f"보너스 **{bonus}**"
+        f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px">{balls}</div>',
+        unsafe_allow_html=True,
     )
 
 dates=pd.to_datetime(df["추첨일"],errors="coerce")
