@@ -2,6 +2,7 @@ import itertools, random, time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 import plotly.express as px
@@ -131,35 +132,63 @@ def log_event(status,count,msg):
     old=pd.read_csv(LOG) if LOG.exists() else pd.DataFrame(columns=row)
     pd.concat([old,pd.DataFrame([row])],ignore_index=True).to_csv(LOG,index=False,encoding="utf-8-sig")
 
-def update_history(years=2, progress=None):
-    old=load_data(); newest=latest_round()
+@st.cache_resource
+def history_update_lock():
+    return Lock()
+
+def update_history(years=2, progress=None, *, only_missing=False):
+    with history_update_lock():
+        return _update_history(years, progress, only_missing)
+
+def _update_history(years, progress, only_missing):
+    old, _ = validate(load_data())
+    newest = latest_round()
     if newest<=0:
         detail = LAST_API_ERROR or "원인을 확인할 수 없는 오류"
         msg = f"동행복권 데이터 조회 실패: {detail}"
         log_event("실패",0,msg); return old,msg
     cutoff=date.today()-timedelta(days=int(years*365.25))
-    first=max(1,newest-int(years*365.25/7)-4); rows=[]
-    targets=list(range(first,newest+1))
+    newest_date = date.fromisoformat(DRAW_CACHE[newest]["추첨일"])
+    weeks_to_collect = max(4, (newest_date - cutoff).days // 7)
+    first = max(1, newest - weeks_to_collect)
+    saved_rounds = set(old["회차"]) if only_missing else set()
+    targets = [n for n in range(first, newest + 1) if n not in saved_rounds]
+    if only_missing and not targets:
+        return old, ""
+    rows = []
     for i,n in enumerate(targets,1):
         row=fetch_draw(n)
         if row:
             try:
-                if datetime.strptime(row["추첨일"],"%Y-%m-%d").date()>=cutoff: rows.append(row)
+                if n >= newest - 4 or date.fromisoformat(row["추첨일"]) >= cutoff:
+                    rows.append(row)
             except Exception: pass
         if progress and (i%4==0 or i==len(targets)):
             progress.progress(i/max(1,len(targets)),text=f"{n}회 확인 중")
         if i%8==0: time.sleep(.1)
-    if not old.empty:
-        for _,r in old.iterrows():
-            try:
-                if datetime.strptime(str(r["추첨일"]),"%Y-%m-%d").date()>=cutoff: rows.append(r.to_dict())
-            except Exception: pass
-    out,issues=validate(pd.DataFrame(rows))
-    if not out.empty: out.to_csv(CSV,index=False,encoding="utf-8-sig")
+    if not rows:
+        detail = LAST_API_ERROR or "당첨번호 응답을 찾지 못했습니다."
+        msg = f"동행복권 데이터 조회 실패: {detail}"
+        log_event("실패", 0, msg)
+        return old, msg
+    combined = pd.concat([old, pd.DataFrame(rows)], ignore_index=True)
+    out, issues = validate(combined)
+    temporary_csv = CSV.with_suffix(".tmp")
+    out.to_csv(temporary_csv, index=False, encoding="utf-8-sig")
+    temporary_csv.replace(CSV)
+    if newest not in set(out["회차"]):
+        msg = f"최신 {newest}회 당첨번호를 가져오지 못했습니다."
+        log_event("실패", len(rows), msg)
+        return out, msg
     msg=f"업데이트 완료: {len(out)}개 회차"
     if not issues.empty: msg+=f" / 검증 경고 {len(issues)}건"
     log_event("성공",len(out),msg)
     return out,msg
+
+@st.cache_data(ttl=300, show_spinner=False)
+def refresh_latest_history():
+    _, message = update_history(only_missing=True)
+    return "실패" in message or "가져오지 못했습니다" in message
 
 def nums(row): return sorted(int(row[c]) for c in NC)
 def runs(ns):
@@ -262,23 +291,39 @@ def run_backtest(df,rounds,per_round,params):
 # Sidebar controls
 st.sidebar.header("데이터 관리")
 years=st.sidebar.selectbox("수집/분석 기간",[1,2,3,5],index=1)
-if st.sidebar.button("🌐 데이터 가져오기 / 업데이트",type="primary",use_container_width=True):
-    bar=st.sidebar.progress(0)
+manual_update = st.sidebar.button("🌐 데이터 가져오기 / 업데이트", type="primary", use_container_width=True)
+reload_saved = st.sidebar.button("📂 저장 데이터 다시 읽기", use_container_width=True)
+if manual_update:
+    bar = st.sidebar.progress(0)
     with st.spinner("공식 API에서 데이터를 확인 중입니다..."):
-        d,msg=update_history(years,bar)
-    st.session_state["history"]=d
-    if "완료" in msg:
-        st.sidebar.success(msg)
+        _, message = update_history(years, bar)
+    refresh_latest_history.clear()
+    if message.startswith("업데이트 완료"):
+        st.sidebar.success(message)
     else:
-        st.sidebar.warning(msg)
-if st.sidebar.button("📂 저장 데이터 다시 읽기",use_container_width=True):
-    st.session_state["history"]=load_data()
-if "history" not in st.session_state: st.session_state["history"]=load_data()
-df,issues=validate(st.session_state["history"])
+        st.sidebar.warning(message)
+elif not reload_saved:
+    with st.spinner("최신 당첨번호 확인 중..."):
+        refresh_failed = refresh_latest_history()
+    if refresh_failed:
+        st.sidebar.warning("최신 당첨번호를 확인하지 못했습니다.")
+
+df, issues = validate(load_data())
+st.sidebar.subheader("최근 당첨번호 5회차")
 if df.empty:
-    st.info("처음 실행 시 왼쪽의 **데이터 가져오기 / 업데이트** 버튼을 누르세요. 인터넷 연결이 필요합니다.")
-    st.code("pip install -r requirements.txt\nstreamlit run app.py",language="bash")
+    st.sidebar.caption("표시할 당첨번호가 없습니다.")
+    st.info("최신 당첨번호를 가져오지 못했습니다. 왼쪽의 **데이터 가져오기 / 업데이트** 버튼으로 다시 시도하세요.")
     st.stop()
+
+for _, draw in df.tail(5).iloc[::-1].iterrows():
+    numbers = " · ".join(str(number) for number in nums(draw))
+    bonus = int(draw["보너스"]) if pd.notna(draw["보너스"]) else "—"
+    st.sidebar.markdown(
+        f"**{int(draw['회차'])}회** · {draw['추첨일']}  \n"
+        f"{numbers}  \n"
+        f"보너스 **{bonus}**"
+    )
+
 dates=pd.to_datetime(df["추첨일"],errors="coerce")
 if dates.notna().any(): df=df[dates>=dates.max()-pd.Timedelta(days=365.25*years)].reset_index(drop=True)
 freq,parity,zone,consec,adj=get_stats(df)
