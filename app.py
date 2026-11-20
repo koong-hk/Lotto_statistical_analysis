@@ -545,7 +545,14 @@ with t5:
 with t6:
     st.subheader("워크포워드 백테스트")
     st.caption("A·B·C·D 네 가지 가중치 조건을 동일한 검증 회차와 조합 수로 비교합니다. 각 테스트 회차는 해당 회차 이전 데이터만 사용하며, 보너스 번호는 일치 수에 포함하지 않습니다.")
-    test_n=st.slider("검증할 최근 회차 수",5,min(40,max(5,len(df)-8)),min(10,max(5,len(df)-8)))
+    max_test_rounds = min(40, len(df) - 8)
+    test_n = 2
+    if max_test_rounds > 2:
+        test_n = st.slider("검증할 최근 회차 수", 2, max_test_rounds, min(10, max_test_rounds))
+    elif max_test_rounds == 2:
+        st.caption("검증할 최근 회차 수는 2회입니다.")
+    else:
+        st.info("최근 2회차를 검증하려면 당첨번호 데이터가 10회차 이상 필요합니다.")
     per=st.slider("조건별 회차당 조합 수",1,30,15)
     bt_sel=st.multiselect("공통 적용할 사용자 가중치 번호",list(range(1,46)),[2,16,21,41],key="bt_sel")
     bt_factor=st.slider("사용자 가중치 배수",1.,5.,2.,.25,key="bt_factor")
@@ -564,7 +571,7 @@ with t6:
     st.dataframe(scenario_table, hide_index=True, use_container_width=True)
     st.caption("사용자 지정 번호 가중치는 A·B·C·D 모두에 동일하게 적용됩니다. 직전 회차 가중치와 사용자 지정 번호가 겹치면 배수가 곱해집니다.")
 
-    if st.button("🧪 A·B·C·D 비교 백테스트 실행",type="primary"):
+    if st.button("🧪 A·B·C·D 비교 백테스트 실행", type="primary", disabled=max_test_rounds < 2):
         all_results=[]
         with st.spinner("A·B·C·D 네 조건을 순차 검증 중입니다..."):
             for code, label, recent_n, recent_mult in scenario_defs:
