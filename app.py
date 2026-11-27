@@ -163,7 +163,26 @@ ar=(adj["공통 개수"]>0).mean() if len(adj) else 0
 st.caption(f"분석 범위 {int(df.iloc[0]['회차'])}~{int(df.iloc[-1]['회차'])}회 · {len(df)}개 회차 · 최신 추첨일 {df.iloc[-1]['추첨일']}")
 a,b,c,d=st.columns(4); a.metric("분석 회차",len(df)); b.metric("최신 회차",f"{int(df.iloc[-1]['회차'])}회"); c.metric("연속번호 포함",f"{cr:.1%}"); d.metric("직전 회차 중복",f"{ar:.1%}")
 
-t1,t2,t_sum,t_gap,t3,t4,t5,t6,t7=st.tabs(["📊 빈도","⚖️ 홀짝·구간","➕ 합계 통계","🕒 장기 미출현 번호","🔗 연속·중복","🔎 반복 3개 조합","🎯 추천 생성","🧪 백테스트","🛠️ 데이터·자동화"])
+t_results,t1,t2,t_sum,t_gap,t3,t4,t5,t6,t7=st.tabs(["🏆 회차별 당첨결과","📊 빈도","⚖️ 홀짝·구간","➕ 합계 통계","🕒 장기 미출현 번호","🔗 연속·중복","🔎 반복 3개 조합","🎯 추천 생성","🧪 백테스트","🛠️ 데이터·자동화"])
+with t_results:
+    st.subheader("회차별 당첨결과")
+    st.caption("선택한 분석 기간의 당첨번호와 1등 당첨 게임 수입니다. 유형별 비율은 해당 회차의 1등 당첨 게임 수 기준이며, 구매 비율이나 당첨 확률이 아닙니다.")
+    results = df.sort_values("회차", ascending=False).copy()
+    results["당첨번호"] = results[NC].astype(str).agg(" · ".join, axis=1)
+    total = pd.to_numeric(results["1등 당첨 게임 수"], errors="coerce")
+    for kind in ["수동", "반자동", "자동"]:
+        results[kind+" 비율"] = pd.to_numeric(results[kind], errors="coerce").div(total.where(total > 0)).mul(100)
+    cols = ["회차", "추첨일", "당첨번호", "보너스", "1등 당첨 게임 수", "수동", "수동 비율", "반자동", "반자동 비율", "자동", "자동 비율"]
+    known = results[WIN_COLS].notna().all(axis=1)
+    st.caption(f"당첨 유형 수집 완료: {int(known.sum())}/{len(results)}회")
+    if not known.all():
+        st.info("미수집 회차는 빈칸으로 표시합니다. 국내 PC에서 python update_lotto.py --years 5 실행 후 CSV를 GitHub에 반영하세요.")
+    st.dataframe(results[cols], hide_index=True, use_container_width=True, column_config={
+        **{c: st.column_config.NumberColumn(c, format="%d") for c in WIN_COLS},
+        **{k+" 비율": st.column_config.NumberColumn(k+" 비율", format="%.1f%%") for k in ["수동", "반자동", "자동"]}
+    })
+    st.download_button("회차별 당첨결과 CSV 다운로드", results[cols].to_csv(index=False).encode("utf-8-sig"), "lotto_draw_results.csv", "text/csv")
+
 with t1:
     period=st.radio("빈도 기준",["최근 4주","최근 8주","전체"],horizontal=True)
     col={"최근 4주":"최근4주","최근 8주":"최근8주","전체":"전체"}[period]
