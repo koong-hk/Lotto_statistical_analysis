@@ -24,6 +24,18 @@ LAST_API_ERROR = ""
 
 NC = [f"번호{i}" for i in range(1, 7)]
 COLS = ["회차", "추첨일", *NC, "보너스"]
+WIN_COLS = ["1등 당첨 게임 수", "자동", "수동", "반자동"]
+ALL_COLS = COLS + WIN_COLS
+
+def winner_counts(values):
+    try:
+        counts = [float(v) for v in values]
+        if not all(v.is_integer() and v >= 0 for v in counts): return {}
+        total, auto, manual, semi = map(int, counts)
+        if total != auto + manual + semi: return {}
+        return dict(zip(WIN_COLS, [total, auto, manual, semi]))
+    except (TypeError, ValueError, OverflowError):
+        return {}
 
 def _api_session():
     session = requests.Session()
@@ -64,7 +76,7 @@ def _convert_new_draw(item):
         if len(set(numbers)) != 6 or not all(1 <= n <= 45 for n in numbers) or not 1 <= bonus <= 45 or bonus in numbers:
             return None
         return {"회차": draw_no, "추첨일": draw_date,
-                **{f"번호{i+1}": numbers[i] for i in range(6)}, "보너스": bonus}
+                **{f"번호{i+1}": numbers[i] for i in range(6)}, "보너스": bonus, **winner_counts([item.get(k) for k in ("rnk1WnNope", "winType1", "winType2", "winType3")])}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -115,7 +127,7 @@ def load_data():
                     return frame
             except (OSError, pd.errors.ParserError, UnicodeError):
                 continue
-    return pd.DataFrame(columns=COLS)
+    return pd.DataFrame(columns=ALL_COLS)
 
 def save_data(frame):
     """원자적 교체로 업데이트 도중 파일 손상을 방지."""
@@ -125,8 +137,8 @@ def save_data(frame):
 
 def validate(raw):
     issues=[]; rows=[]
-    if raw is None or raw.empty: return pd.DataFrame(columns=COLS), pd.DataFrame(columns=["행","문제"])
-    if not set(COLS).issubset(raw.columns): return pd.DataFrame(columns=COLS), pd.DataFrame([{"행":"-","문제":"필수 열 누락"}])
+    if raw is None or raw.empty: return pd.DataFrame(columns=ALL_COLS), pd.DataFrame(columns=["행","문제"])
+    if not set(COLS).issubset(raw.columns): return pd.DataFrame(columns=ALL_COLS), pd.DataFrame([{"행":"-","문제":"필수 열 누락"}])
     for i, (_, r) in enumerate(raw.iterrows(), 2):
         try:
             vals=[float(r[c]) for c in ["회차",*NC,"보너스"]]
@@ -134,9 +146,15 @@ def validate(raw):
             n,*balls=map(int,vals)
             if n<1 or len(set(balls))!=7 or not all(1<=v<=45 for v in balls): raise ValueError()
             d=datetime.strptime(str(r["추첨일"]),"%Y-%m-%d").strftime("%Y-%m-%d")
-            rows.append(dict(zip(COLS,[n,d,*sorted(balls[:6]),balls[6]])))
+            rows.append({**dict(zip(COLS,[n,d,*sorted(balls[:6]),balls[6]])), **winner_counts([r.get(c) for c in WIN_COLS])})
         except (ValueError,TypeError,OverflowError): issues.append({"행":i,"문제":"회차/날짜/번호 오류"})
-    df=pd.DataFrame(rows,columns=COLS).drop_duplicates("회차",keep="last").sort_values("회차").reset_index(drop=True)
+    df=pd.DataFrame(rows,columns=ALL_COLS)
+    if not df.empty:
+        # Preserve known winner counts when importing an older number-only CSV.
+        metadata=df.dropna(subset=WIN_COLS).drop_duplicates("회차",keep="last").set_index("회차")[WIN_COLS]
+        df=df.drop_duplicates("회차",keep="last").set_index("회차")
+        df[WIN_COLS]=df[WIN_COLS].combine_first(metadata).reindex(df.index)
+        df=df.reset_index().sort_values("회차").reset_index(drop=True)
     if not df.empty:
         for n in sorted(set(range(int(df["회차"].min()),int(df["회차"].max())+1))-set(df["회차"])): issues.append({"행":"-","문제":f"{n}회 누락"})
     return df,pd.DataFrame(issues,columns=["행","문제"])
@@ -156,15 +174,19 @@ def update_history(years=5):
     if not newest: return old, f"조회 실패: {LAST_API_ERROR}", False
     first=max(1,newest-int(years*365.25/7))
     existing=set(old["회차"]); calls=0
+    complete=set(old.dropna(subset=WIN_COLS)["회차"])
+
     for n in range(newest,first-1,-1):
-        if n in existing or n in DRAW_CACHE: continue
+        if n in complete or n in DRAW_CACHE: continue
         calls+=1
         if fetch_draw(n) is None: break
         time.sleep(.3)
-    fresh=pd.DataFrame([r for n,r in DRAW_CACHE.items() if first<=n<=newest],columns=COLS)
+    fresh=pd.DataFrame([r for n,r in DRAW_CACHE.items() if first<=n<=newest],columns=ALL_COLS)
     out,_=validate(pd.concat([old,fresh],ignore_index=True))
     missing=set(range(first,newest+1))-set(out["회차"])
     if not out.empty: save_data(out)
     msg=f"저장 {len(out)}회 / 신규 {len(set(out['회차'])-existing)}회 / 추가 API 호출 {calls}회 / 누락 {len(missing)}회"
-    log_event("부분 성공" if missing else "성공",len(out),msg)
+    missing_stats = len(out.loc[out["회차"].between(first,newest) & out[WIN_COLS].isna().any(axis=1)])
+    msg += f" / 당첨 유형 미확인 {missing_stats}회"
+    log_event("부분 성공" if missing or missing_stats else "성공",len(out),msg)
     return out,msg,not missing
