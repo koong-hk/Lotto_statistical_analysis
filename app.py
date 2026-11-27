@@ -277,12 +277,31 @@ with t4:
     st.subheader("반복 3개 번호 조합")
     st.caption("선택한 분석 기간 내 본번호 6개에서 동일한 3개 번호가 2회 이상 함께 출현한 조합입니다. 보너스 번호는 제외합니다.")
     tri = triples_table(df)
+    st.markdown("#### 번호 조합 검색")
+    search_nums = st.multiselect("검색할 번호 3개를 선택하세요", list(range(1, 46)), max_selections=3, key="triple_search_nums")
+    hits = []
+    if len(search_nums) == 3:
+        wanted = set(search_nums)
+        hits = sorted({int(row["회차"]) for _, row in df.iterrows() if wanted.issubset({int(row[f"번호{i}"]) for i in range(1, 7)})}, reverse=True)
+        if len(hits) >= 2:
+            st.success(f"반복 조합에 있습니다: {len(hits)}회 출현")
+        elif hits:
+            st.info("1회 출현: 반복 조합 목록에는 없습니다.")
+        else:
+            st.info("선택한 분석 기간에 출현 기록이 없습니다.")
+        if hits:
+            st.write("출현 회차: " + ", ".join(map(str, hits)))
+    else:
+        st.caption("서로 다른 번호 3개를 선택하면 자동 검색합니다.")
+    st.markdown("#### 전체 반복 조합 목록")
     if tri.empty:
         st.info("2회 이상 반복된 3개 번호 조합이 없습니다.")
     else:
         max_count = int(tri["동시 출현 횟수"].max())
         threshold = st.selectbox("최소 동시 출현 횟수", list(range(2, max_count + 1)), key="triple_threshold")
         filtered = tri.loc[tri["동시 출현 횟수"] >= threshold].reset_index(drop=True)
+        if len(search_nums) == 3 and 2 <= len(hits) < threshold:
+            st.caption(f"검색 조합은 현재 최소 {threshold}회 필터에 해당하지 않습니다.")
         st.metric("반복 조합 수", len(filtered))
         st.dataframe(filtered, hide_index=True, use_container_width=True)
         st.download_button("반복 3개 조합 CSV 다운로드", filtered.to_csv(index=False).encode("utf-8-sig"), "lotto_repeated_triples.csv", "text/csv")
