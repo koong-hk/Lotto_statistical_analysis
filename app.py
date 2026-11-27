@@ -1,8 +1,9 @@
-import itertools, random, time
+import itertools, random, time, os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from threading import Lock
 
 import pandas as pd
 import plotly.express as px
@@ -10,197 +11,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="로또 통계 분석 Pro", page_icon="🎱", layout="wide")
-ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
-CSV = DATA / "lotto_history.csv"
-LOG = DATA / "update_log.csv"
-BASE_API = "https://www.dhlottery.co.kr/lt645"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
-    "Referer": "https://www.dhlottery.co.kr/lt645/result",
-    "X-Requested-With": "XMLHttpRequest",
-    "Accept": "application/json, text/plain, */*",
-}
-DRAW_CACHE = {}
-LAST_API_ERROR = ""
-
-NC = [f"번호{i}" for i in range(1, 7)]
-COLS = ["회차", "추첨일", *NC, "보너스"]
-
-def _get_new_api_list(url, params=None):
-    """동행복권 개편 후 JSON 응답을 읽고 응답 형식을 확인한다."""
-    r = requests.get(url, params=params, timeout=15, headers=HEADERS)
-    r.raise_for_status()
-    content_type = r.headers.get("Content-Type", "").lower()
-    if "json" not in content_type:
-        raise RuntimeError(
-            f"JSON이 아닌 응답을 받았습니다 (HTTP {r.status_code}, "
-            f"Content-Type={content_type or '없음'}). 접속 차단/대기 페이지일 수 있습니다."
-        )
-    payload = r.json()
-    rows = payload.get("data", {}).get("list", [])
-    if not isinstance(rows, list):
-        raise RuntimeError("새 API 응답에 data.list 목록이 없습니다.")
-    return rows
-
-def _convert_new_draw(item):
-    """새 API 필드명을 앱 내부의 기존 CSV 열 이름으로 변환한다."""
-    try:
-        draw_no = int(item["ltEpsd"])
-        raw_date = str(item["ltRflYmd"])
-        if len(raw_date) == 8 and raw_date.isdigit():
-            draw_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
-        else:
-            draw_date = datetime.strptime(raw_date[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
-        numbers = [int(item[f"tm{i}WnNo"]) for i in range(1, 7)]
-        bonus = int(item["bnsWnNo"])
-        if len(set(numbers)) != 6 or not all(1 <= n <= 45 for n in numbers) or not 1 <= bonus <= 45:
-            return None
-        return {"회차": draw_no, "추첨일": draw_date,
-                **{f"번호{i+1}": numbers[i] for i in range(6)}, "보너스": bonus}
-    except (KeyError, TypeError, ValueError):
-        return None
-
-def fetch_draw(n):
-    """특정 회차를 새 API에서 조회한다. 한 응답의 주변 회차도 캐시에 저장한다."""
-    global LAST_API_ERROR
-    n = int(n)
-    if n in DRAW_CACHE:
-        return DRAW_CACHE[n]
-    try:
-        rows = _get_new_api_list(
-            f"{BASE_API}/selectPstLt645InfoNew.do",
-            {"srchDir": "center", "srchLtEpsd": n},
-        )
-        for item in rows:
-            row = _convert_new_draw(item)
-            if row:
-                DRAW_CACHE[row["회차"]] = row
-        return DRAW_CACHE.get(n)
-    except Exception as exc:
-        LAST_API_ERROR = f"{type(exc).__name__}: {exc}"
-        return None
-
-def latest_round():
-    """최신 추첨 결과 조회 API로 발표된 최신 회차를 확인한다."""
-    global LAST_API_ERROR
-    try:
-        rows = _get_new_api_list(f"{BASE_API}/selectPstLt645Info.do")
-        converted = [_convert_new_draw(item) for item in rows]
-        converted = [r for r in converted if r]
-        if not converted:
-            raise RuntimeError("최신 회차 응답에서 당첨번호를 찾지 못했습니다.")
-        for row in converted:
-            DRAW_CACHE[row["회차"]] = row
-        LAST_API_ERROR = ""
-        return max(row["회차"] for row in converted)
-    except Exception as exc:
-        LAST_API_ERROR = f"{type(exc).__name__}: {exc}"
-        return 0
-
-def load_data():
-    try: return pd.read_csv(CSV, dtype={"추첨일":str}) if CSV.exists() else pd.DataFrame(columns=COLS)
-    except Exception: return pd.DataFrame(columns=COLS)
-
-def validate(raw):
-    issues=[]
-    if raw is None or raw.empty: return pd.DataFrame(columns=COLS), pd.DataFrame(columns=["행","문제"])
-    df=raw.copy()
-    missing=[c for c in COLS if c not in df.columns]
-    if missing: return pd.DataFrame(columns=COLS), pd.DataFrame([{"행":"-","문제":f"필수 열 누락: {missing}"}])
-    for c in ["회차",*NC,"보너스"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-    for ix,r in df.iterrows():
-        probs=[]
-        if pd.isna(r["회차"]): probs.append("회차 오류")
-        ns=[r[c] for c in NC]
-        if any(pd.isna(x) for x in ns): probs.append("번호 누락")
-        elif any(x<1 or x>45 for x in ns) or len(set(ns))!=6: probs.append("번호 범위/중복 오류")
-        try: datetime.strptime(str(r["추첨일"]),"%Y-%m-%d")
-        except Exception: probs.append("추첨일 형식 오류")
-        if probs: issues.append({"행":int(ix)+2,"문제":", ".join(probs)})
-    df=df.dropna(subset=["회차",*NC]).copy()
-    df["회차"]=df["회차"].astype(int); df[NC]=df[NC].astype(int)
-    df=df.drop_duplicates("회차",keep="last").sort_values("회차").reset_index(drop=True)
-    if not df.empty:
-        actual=set(df["회차"]); expected=set(range(int(df["회차"].min()),int(df["회차"].max())+1))
-        for n in sorted(expected-actual): issues.append({"행":"-","문제":f"{n}회 누락"})
-    return df,pd.DataFrame(issues,columns=["행","문제"])
-
-def log_event(status,count,msg):
-    row={"실행시각":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"상태":status,"수집회차":count,"메시지":msg}
-    old=pd.read_csv(LOG) if LOG.exists() else pd.DataFrame(columns=row)
-    pd.concat([old,pd.DataFrame([row])],ignore_index=True).to_csv(LOG,index=False,encoding="utf-8-sig")
-
-@st.cache_resource
-def history_update_lock():
-    return Lock()
-
-def update_history(years=2, progress=None, *, only_missing=False):
-    with history_update_lock():
-        return _update_history(years, progress, only_missing)
-
-def _update_history(years, progress, only_missing):
-    old, _ = validate(load_data())
-    newest = latest_round()
-    if newest<=0:
-        detail = LAST_API_ERROR or "원인을 확인할 수 없는 오류"
-        msg = f"동행복권 데이터 조회 실패: {detail}"
-        log_event("실패",0,msg); return old,msg
-    cutoff=date.today()-timedelta(days=int(years*365.25))
-    newest_date = date.fromisoformat(DRAW_CACHE[newest]["추첨일"])
-    weeks_to_collect = max(4, (newest_date - cutoff).days // 7)
-    first = max(1, newest - weeks_to_collect)
-    saved_rounds = set(old["회차"]) if only_missing else set()
-    targets = [n for n in range(first, newest + 1) if n not in saved_rounds]
-    if only_missing and not targets:
-        return old, ""
-    rows = []
-    for i,n in enumerate(targets,1):
-        row=fetch_draw(n)
-        if row:
-            try:
-                if n >= newest - 4 or date.fromisoformat(row["추첨일"]) >= cutoff:
-                    rows.append(row)
-            except Exception: pass
-        if progress and (i%4==0 or i==len(targets)):
-            progress.progress(i/max(1,len(targets)),text=f"{n}회 확인 중")
-        if i%8==0: time.sleep(.1)
-    if not rows:
-        detail = LAST_API_ERROR or "당첨번호 응답을 찾지 못했습니다."
-        msg = f"동행복권 데이터 조회 실패: {detail}"
-        log_event("실패", 0, msg)
-        return old, msg
-    combined = pd.concat([old, pd.DataFrame(rows)], ignore_index=True)
-    out, issues = validate(combined)
-    temporary_csv = CSV.with_suffix(".tmp")
-    out.to_csv(temporary_csv, index=False, encoding="utf-8-sig")
-    temporary_csv.replace(CSV)
-    if newest not in set(out["회차"]):
-        msg = f"최신 {newest}회 당첨번호를 가져오지 못했습니다."
-        log_event("실패", len(rows), msg)
-        return out, msg
-    msg=f"업데이트 완료: {len(out)}개 회차"
-    if not issues.empty: msg+=f" / 검증 경고 {len(issues)}건"
-    log_event("성공",len(out),msg)
-    return out,msg
-
-@st.cache_data(ttl=300, show_spinner=False)
-def refresh_latest_history():
-    _, message = update_history(only_missing=True)
-    return "실패" in message or "가져오지 못했습니다" in message
-
-# 당첨번호 색상은 1~9부터 37~45까지 9개 단위로 구분한다.
-LOTTO_BALL_COLORS = ("#facc15", "#60a5fa", "#f87171", "#cbd5e1", "#4ade80")
-
-def lotto_ball(number, *, bonus=False):
-    color = LOTTO_BALL_COLORS[(number - 1) // 9] if 1 <= number <= 45 else "#cbd5e1"
-    label = f' title="보너스 번호 {number}" aria-label="보너스 번호 {number}"' if bonus else ""
-    return (
-        f'<span{label} style="display:inline-flex;align-items:center;justify-content:center;'
-        f'width:26px;height:26px;border-radius:50%;background-color:{color};'
-        f'color:#111827;font-weight:700;font-size:13px;flex-shrink:0">{number}</span>'
-    )
+from lotto_data import *
 
 def nums(row): return sorted(int(row[c]) for c in NC)
 def runs(ns):
@@ -229,22 +40,14 @@ def get_stats(df):
         if i:
             prev=set(nums(df.iloc[i-1])); shared=sorted(prev&set(ns))
             adj.append({"이전 회차":int(df.iloc[i-1]["회차"]),"현재 회차":int(r["회차"]),"공통 번호":", ".join(map(str,shared)) if shared else "-","공통 개수":len(shared)})
-    return freq,pd.DataFrame(par),pd.DataFrame(zon),pd.DataFrame(con),pd.DataFrame(adj)
+    return freq,pd.DataFrame(par),pd.DataFrame(zon),pd.DataFrame(con),pd.DataFrame(adj,columns=["이전 회차","현재 회차","공통 번호","공통 개수"])
 
 def triples_table(df):
     seen={}
     for _,r in df.iterrows():
         for tri in itertools.combinations(nums(r),3): seen.setdefault(tri,[]).append(int(r["회차"]))
-    rows = [
-        {"번호 조합": ", ".join(map(str, numbers)), "동시 출현 횟수": len(rounds),
-         "회차 목록": ", ".join(map(str, sorted(rounds))), "최신 회차": max(rounds)}
-        for numbers, rounds in seen.items() if len(rounds) >= 2
-    ]
-    if not rows:
-        return pd.DataFrame(columns=["번호 조합", "동시 출현 횟수", "회차 목록"])
-    return pd.DataFrame(rows).sort_values(
-        ["최신 회차", "동시 출현 횟수", "번호 조합"], ascending=[False, False, True]
-    ).drop(columns="최신 회차")
+    rows=[{"번호 조합":", ".join(map(str,k)),"동시 출현 횟수":len(v),"회차 목록":", ".join(map(str,v))} for k,v in seen.items() if len(v)>=2]
+    return pd.DataFrame(rows).sort_values(["동시 출현 횟수","번호 조합"],ascending=[False,True]) if rows else pd.DataFrame(columns=["번호 조합","동시 출현 횟수","회차 목록"])
 
 def weight_scores(df,window,rstrength,lstrength,gstrength):
     recent=Counter(n for _,r in df.tail(window).iterrows() for n in nums(r))
@@ -311,70 +114,47 @@ def run_backtest(df,rounds,per_round,params):
 # Sidebar controls
 st.sidebar.header("데이터 관리")
 years=st.sidebar.selectbox("수집/분석 기간",[1,2,3,5],index=1)
-manual_update = st.sidebar.button("🌐 데이터 가져오기 / 업데이트", type="primary", use_container_width=True)
-reload_saved = st.sidebar.button("📂 저장 데이터 다시 읽기", use_container_width=True)
-if manual_update:
-    bar = st.sidebar.progress(0)
-    with st.spinner("공식 API에서 데이터를 확인 중입니다..."):
-        _, message = update_history(years, bar)
-    refresh_latest_history.clear()
-    if message.startswith("업데이트 완료"):
-        st.sidebar.success(message)
-    else:
-        st.sidebar.warning(message)
-elif not reload_saved:
-    with st.spinner("최신 당첨번호 확인 중..."):
-        refresh_failed = refresh_latest_history()
-    if refresh_failed:
-        st.sidebar.warning("최신 당첨번호를 확인하지 못했습니다.")
-
-def show_sidebar_draw(draw):
-    st.sidebar.markdown(f"**{int(draw['회차'])}회** · {draw['추첨일']}")
-    balls = "".join(lotto_ball(number) for number in nums(draw))
-    if pd.notna(draw["보너스"]):
-        balls += f'<span aria-hidden="true">+</span>{lotto_ball(int(draw["보너스"]), bonus=True)}'
-    st.sidebar.markdown(
-        f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px">{balls}</div>',
-        unsafe_allow_html=True,
-    )
-
-df, issues = validate(load_data())
-st.sidebar.subheader("회차별 당첨번호 검색")
-with st.sidebar.form("sidebar_draw_search"):
-    query = st.text_input("회차 번호", placeholder="예: 1246", max_chars=12)
-    submitted = st.form_submit_button("검색", use_container_width=True)
-
-if submitted:
-    st.session_state.pop("sidebar_draw_result", None)
-    round_text = query.strip().removesuffix("회").strip()
-    if not round_text.isascii() or not round_text.isdecimal() or int(round_text) <= 0:
-        st.sidebar.warning("1 이상의 회차 번호를 입력하세요.")
-    else:
-        draw_number = int(round_text)
-        saved = df.loc[df["회차"] == draw_number]
-        if saved.empty:
-            with st.spinner(f"{draw_number}회 당첨번호 확인 중..."):
-                with history_update_lock():
-                    found = fetch_draw(draw_number)
-        else:
-            found = saved.iloc[0].to_dict()
-        if found is None:
-            st.sidebar.warning(f"{draw_number}회 당첨번호를 조회하지 못했습니다. 회차 번호를 확인하거나 잠시 후 다시 시도하세요.")
-        else:
-            st.session_state["sidebar_draw_result"] = found
-
-if "sidebar_draw_result" in st.session_state:
-    show_sidebar_draw(st.session_state["sidebar_draw_result"])
-
-st.sidebar.subheader("최근 당첨번호 5회차")
+if "history" not in st.session_state or st.sidebar.button("저장 데이터 다시 읽기"):
+    st.session_state["history"]=load_data()
+with st.sidebar.expander("CSV 복원 / 수동 입력"):
+    uploaded=st.file_uploader("당첨번호 CSV",type="csv")
+    if uploaded is not None and st.button("CSV 병합"):
+        try:
+            incoming,err=validate(pd.read_csv(uploaded))
+            if incoming.empty: st.error("유효한 데이터 없음")
+            else:
+                st.session_state["history"],_=validate(pd.concat([st.session_state["history"],incoming],ignore_index=True)); st.success(f"병합 완료: 검증 경고 {len(err)}건")
+        except Exception as exc: st.error(str(exc))
+    with st.form("manual_draw"):
+        rn=st.number_input("회차",min_value=1,step=1,value=1252)
+        dt=st.date_input("추첨일")
+        balls=st.text_input("본번호 6개와 보너스 (공백 구분)")
+        if st.form_submit_button("회차 추가"):
+            try:
+                values=list(map(int,balls.split()))
+                incoming,_=validate(pd.DataFrame([dict(zip(COLS,[rn,str(dt),*values]))])) if len(values)==7 else (pd.DataFrame(),None)
+                if incoming.empty: raise ValueError("번호 7개를 중복 없이 입력하세요.")
+                st.session_state["history"],_=validate(pd.concat([st.session_state["history"],incoming],ignore_index=True)); st.success("추가 완료")
+            except Exception as exc: st.error(str(exc))
+    st.caption("수동 변경은 현재 세션에만 유지됩니다. CSV를 내려받아 GitHub에 반영하세요.")
+df,issues=validate(st.session_state["history"])
 if df.empty:
-    st.sidebar.caption("표시할 당첨번호가 없습니다.")
-    st.info("최신 당첨번호를 가져오지 못했습니다. 왼쪽의 **데이터 가져오기 / 업데이트** 버튼으로 다시 시도하세요.")
+    st.info("국내 PC에서 python update_lotto.py 실행 후 data/lotto_history.csv를 GitHub에 올리거나 CSV를 복원하세요.")
     st.stop()
-
-for _, draw in df.tail(5).iloc[::-1].iterrows():
-    show_sidebar_draw(draw)
-
+st.sidebar.download_button("전체 CSV 다운로드",df.to_csv(index=False).encode("utf-8-sig"),"lotto_history.csv")
+st.sidebar.caption(f"저장 최신 회차: {df.iloc[-1]['회차']}회 / {df.iloc[-1]['추첨일']}")
+if CSV.exists(): st.sidebar.caption("CSV 파일 수정 시각 (서버 기준): "+datetime.fromtimestamp(CSV.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
+def show_draw(r):
+    colors=["#c89b16","#2783c5","#d34e4e","#777777","#519742"]
+    balls=" ".join(f'<span style="display:inline-block;background:{colors[(int(n)-1)//10]};color:white;border-radius:50%;width:25px;height:25px;text-align:center;line-height:25px">{int(n)}</span>' for n in [*nums(r),r["보너스"]])
+    st.markdown(f"**{int(r['회차'])}회** · {r['추첨일']}<br>{balls}",unsafe_allow_html=True)
+with st.sidebar:
+    st.subheader("최근 5회 당첨번호")
+    for _,r in df.tail(5).iloc[::-1].iterrows(): show_draw(r)
+    query=st.number_input("회차 검색",min_value=1,step=1,value=int(df.iloc[-1]["회차"]))
+    found=df[df["회차"]==query]
+    if not found.empty: show_draw(found.iloc[0])
+    else: st.caption("저장된 회차 없음")
 dates=pd.to_datetime(df["추첨일"],errors="coerce")
 if dates.notna().any(): df=df[dates>=dates.max()-pd.Timedelta(days=365.25*years)].reset_index(drop=True)
 freq,parity,zone,consec,adj=get_stats(df)
@@ -494,42 +274,25 @@ with t3:
     st.write(f"직전 회차와 본번호가 하나 이상 겹치는 비율: **{ar:.2%}**")
     st.dataframe(adj.sort_values("현재 회차",ascending=False),hide_index=True,use_container_width=True)
 with t4:
-    st.caption("선택한 분석 기간에 본번호 3개가 함께 나온 조합과 해당 회차를 표시합니다.")
-    query = st.text_input("회차로 찾기", placeholder="예: 1246, 1250")
-    requested = set(query.replace(",", " ").split())
-    available = set(df["회차"].astype(str))
-    missing = requested - available
-
-    if any(not token.isascii() or not token.isdecimal() for token in requested):
-        st.info("회차 번호는 쉼표나 공백으로 구분해 입력하세요.")
-    elif missing:
-        st.info(f"현재 분석 데이터에 없는 회차: {', '.join(sorted(missing))}")
+    st.subheader("반복 3개 번호 조합")
+    st.caption("선택한 분석 기간 내 본번호 6개에서 동일한 3개 번호가 2회 이상 함께 출현한 조합입니다. 보너스 번호는 제외합니다.")
+    tri = triples_table(df)
+    if tri.empty:
+        st.info("2회 이상 반복된 3개 번호 조합이 없습니다.")
     else:
-        tri = triples_table(df)
-        if requested:
-            matches = tri["회차 목록"].map(
-                lambda rounds: requested.issubset(rounds.split(", "))
-            ).astype(bool)
-            tri = tri.loc[matches]
-        if tri.empty:
-            st.info("조건에 맞는 반복 3개 조합이 없습니다.")
-        else:
-            max_count = int(tri["동시 출현 횟수"].max())
-            threshold = 2
-            if not requested and max_count > 2:
-                threshold = st.slider("최소 동시 출현 횟수", 2, max_count, 2, key="triple_min_count")
-            st.dataframe(
-                tri.loc[tri["동시 출현 횟수"] >= threshold],
-                hide_index=True,
-                use_container_width=True,
-            )
+        max_count = int(tri["동시 출현 횟수"].max())
+        threshold = st.selectbox("최소 동시 출현 횟수", list(range(2, max_count + 1)), key="triple_threshold")
+        filtered = tri.loc[tri["동시 출현 횟수"] >= threshold].reset_index(drop=True)
+        st.metric("반복 조합 수", len(filtered))
+        st.dataframe(filtered, hide_index=True, use_container_width=True)
+        st.download_button("반복 3개 조합 CSV 다운로드", filtered.to_csv(index=False).encode("utf-8-sig"), "lotto_repeated_triples.csv", "text/csv")
 
 # Recommendation controls are also reused by backtest.
 with t5:
     st.subheader("가중치 자동 계산 + 사용자 지정 가중치")
     selected=st.multiselect("가중치를 적용할 번호",list(range(1,46)),[2,16,21,41],key="sel")
     factor=st.slider("선택 번호 가중치 배수",1.0,5.0,2.0,.25,key="factor")
-    window=st.slider("최근 빈도 분석 기간(회)",4,min(52,max(4,len(df))),min(8,max(4,len(df))),key="window")
+    window=st.slider("최근 빈도 분석 기간(회)",1,max(2,min(52,len(df))),min(8,len(df)),key="window")
     rs=st.slider("최근 빈도 반영 강도",0.,2.,.5,.1,key="rs")
     ls=st.slider("전체 빈도 반영 강도",0.,2.,.2,.1,key="ls")
     gs=st.slider("미출현 기간 반영 강도",0.,2.,0.,.1,key="gs")
@@ -574,15 +337,8 @@ with t5:
 
 with t6:
     st.subheader("워크포워드 백테스트")
-    st.caption("A·B·C·D·E 다섯 가지 가중치 조건을 동일한 검증 회차와 조합 수로 비교합니다. 각 테스트 회차는 해당 회차 이전 데이터만 사용하며, 보너스 번호는 일치 수에 포함하지 않습니다.")
-    max_test_rounds = min(40, len(df) - 8)
-    test_n = 2
-    if max_test_rounds > 2:
-        test_n = st.slider("검증할 최근 회차 수", 2, max_test_rounds, min(10, max_test_rounds))
-    elif max_test_rounds == 2:
-        st.caption("검증할 최근 회차 수는 2회입니다.")
-    else:
-        st.info("최근 2회차를 검증하려면 당첨번호 데이터가 10회차 이상 필요합니다.")
+    st.caption("A·B·C·D 네 가지 가중치 조건을 동일한 검증 회차와 조합 수로 비교합니다. 각 테스트 회차는 해당 회차 이전 데이터만 사용하며, 보너스 번호는 일치 수에 포함하지 않습니다.")
+    test_n=st.slider("검증할 최근 회차 수",2,max(3,min(40,len(df)-8)),min(10,max(2,len(df)-8)))
     per=st.slider("조건별 회차당 조합 수",1,30,15)
     bt_sel=st.multiselect("공통 적용할 사용자 가중치 번호",list(range(1,46)),[2,16,21,41],key="bt_sel")
     bt_factor=st.slider("사용자 가중치 배수",1.,5.,2.,.25,key="bt_factor")
@@ -592,7 +348,6 @@ with t6:
         ("B", "직전 2회 × 2배", 2, 2.0),
         ("C", "직전 4회 × 2배", 4, 2.0),
         ("D", "직전 5회 × 3배", 5, 3.0),
-        ("E", "직전 7회 × 4배", 7, 4.0),
     ]
     st.markdown("#### 비교 조건")
     scenario_table = pd.DataFrame([
@@ -600,11 +355,11 @@ with t6:
         for code, label, n, factor in scenario_defs
     ])
     st.dataframe(scenario_table, hide_index=True, use_container_width=True)
-    st.caption("사용자 지정 번호 가중치는 A·B·C·D·E 모두에 동일하게 적용됩니다. 직전 회차 가중치와 사용자 지정 번호가 겹치면 배수가 곱해집니다.")
+    st.caption("사용자 지정 번호 가중치는 A·B·C·D 모두에 동일하게 적용됩니다. 직전 회차 가중치와 사용자 지정 번호가 겹치면 배수가 곱해집니다.")
 
-    if st.button("🧪 A·B·C·D·E 비교 백테스트 실행", type="primary", disabled=max_test_rounds < 2):
+    if st.button("🧪 A·B·C·D 비교 백테스트 실행",type="primary"):
         all_results=[]
-        with st.spinner("A·B·C·D·E 다섯 조건을 순차 검증 중입니다..."):
+        with st.spinner("A·B·C·D 네 조건을 순차 검증 중입니다..."):
             for code, label, recent_n, recent_mult in scenario_defs:
                 params={"weights":{n:bt_factor for n in bt_sel},
                         "recent_rounds":recent_n,"recent_factor":recent_mult,
@@ -616,10 +371,10 @@ with t6:
                     result.insert(0,"조건",code)
                     result.insert(1,"조건 설명",label)
                     all_results.append(result)
-        st.session_state["bt_compare_abcde"]=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
-        st.session_state["bt_compare_abcde_settings"]={"test_n":test_n,"per":per,"user_numbers":bt_sel,"user_factor":bt_factor}
+        st.session_state["bt_compare"]=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
+        st.session_state["bt_compare_settings"]={"test_n":test_n,"per":per,"user_numbers":bt_sel,"user_factor":bt_factor}
 
-    bt=st.session_state.get("bt_compare_abcde",pd.DataFrame())
+    bt=st.session_state.get("bt_compare",pd.DataFrame())
     if not bt.empty:
         # 조건별 비교 지표: 평균 적중 수, 회차별 최고 적중 수 평균, 3개 이상 적중 조합 수
         summary_rows=[]
@@ -633,7 +388,7 @@ with t6:
               .groupby("조건").mean().rename("회차별최고일치 평균").reset_index())
         summary=summary.merge(best,on="조건",how="left")
         summary=summary[["조건","조건 설명","생성조합수","평균일치개수","회차별최고일치 평균","3개이상적중","4개이상적중"]]
-        st.markdown("#### A·B·C·D·E 성능 비교")
+        st.markdown("#### A·B·C·D 성능 비교")
         st.dataframe(summary.round({"평균일치개수":3,"회차별최고일치 평균":3}),hide_index=True,use_container_width=True)
         chart=summary.melt(id_vars=["조건"],value_vars=["평균일치개수","회차별최고일치 평균"],var_name="지표",value_name="평균 적중")
         st.plotly_chart(px.bar(chart,x="조건",y="평균 적중",color="지표",barmode="group",title="조건별 평균 적중 수 비교"),use_container_width=True)
@@ -641,36 +396,17 @@ with t6:
         st.plotly_chart(px.bar(dist,x="일치 개수",y="조합 수",color="조건",barmode="group",title="조건별 일치 개수 분포"),use_container_width=True)
         st.markdown("#### 회차별 최고 적중 수")
         best_each=bt.groupby(["조건","회차"])["일치 개수"].max().reset_index(name="최고 일치")
-        st.plotly_chart(px.line(best_each,x="회차",y="최고 일치",color="조건",markers=True,title="A·B·C·D·E 회차별 최고 적중 비교"),use_container_width=True)
+        st.plotly_chart(px.line(best_each,x="회차",y="최고 일치",color="조건",markers=True,title="A·B·C·D 회차별 최고 적중 비교"),use_container_width=True)
         st.markdown("#### 전체 추천 조합 결과")
         st.dataframe(bt.sort_values(["조건","회차","일치 개수"],ascending=[True,False,False]),hide_index=True,use_container_width=True)
-        st.download_button("A·B·C·D·E 전체 결과 CSV 다운로드",bt.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCDE.csv","text/csv")
-        st.download_button("A·B·C·D·E 요약 CSV 다운로드",summary.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCDE_summary.csv","text/csv")
+        st.download_button("A·B·C·D 전체 결과 CSV 다운로드",bt.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCD.csv","text/csv")
+        st.download_button("A·B·C·D 요약 CSV 다운로드",summary.to_csv(index=False).encode("utf-8-sig"),"lotto_backtest_ABCD_summary.csv","text/csv")
     else:
-        st.info("A·B·C·D·E 비교 백테스트 실행 버튼을 눌러 다섯 조건을 한 번에 비교하세요.")
+        st.info("A·B·C·D 비교 백테스트 실행 버튼을 눌러 네 조건을 한 번에 비교하세요.")
 
 with t7:
-    st.subheader("API 연결 진단")
-    if st.button("연결 테스트"):
-        try:
-            test_rows = _get_new_api_list(f"{BASE_API}/selectPstLt645Info.do")
-            st.success(f"연결 성공: 최신 회차 응답 {len(test_rows)}건 수신")
-            if test_rows:
-                st.json(test_rows[0])
-        except Exception as exc:
-            st.error(f"{type(exc).__name__}: {exc}")
-    st.caption("동행복권 홈페이지 개편 후 새 조회 경로를 사용합니다. 접속 제한/응답 형식 변경 시 이곳에서 오류를 확인하세요.")
-    st.subheader("데이터 검증")
-    if issues.empty: st.success("데이터 검증에서 회차 누락이나 형식 오류가 발견되지 않았습니다.")
-    else:
-        st.warning(f"검증 경고 {len(issues)}건")
-        st.dataframe(issues,hide_index=True,use_container_width=True)
-    st.download_button("현재 당첨번호 CSV 다운로드",df.to_csv(index=False).encode("utf-8-sig"),"lotto_history.csv","text/csv")
-    st.subheader("업데이트 로그")
-    if LOG.exists():
-        logs=pd.read_csv(LOG); st.dataframe(logs.sort_values("실행시각",ascending=False),hide_index=True,use_container_width=True)
-    else: st.info("업데이트 기록이 없습니다.")
-    st.subheader("주간 자동 업데이트 설정")
-    st.info("자동 업데이트 예약 안내는 README.md를 참고하세요.")
-    st.markdown("자동 가중치는 최근 빈도·전체 빈도·미출현 기간을 별도 조절합니다. 필터는 홀짝·합계·구간 수·연속번호·필수/제외 번호를 지원합니다.")
-    st.caption("공식 API의 접근 가능 여부와 응답 형식에 따라 업데이트가 실패할 수 있습니다. 업데이트 로그를 확인하세요.")
+    st.subheader("데이터 검증 및 자동화")
+    if issues.empty: st.success("검증 경고 없음")
+    else: st.dataframe(issues,hide_index=True)
+    st.info("공식 API 수집은 국내 PC의 update_lotto.py에서 수행합니다. Cloud는 GitHub CSV만 읽습니다.")
+    if LOG.exists(): st.dataframe(pd.read_csv(LOG),hide_index=True)
